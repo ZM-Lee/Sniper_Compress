@@ -1,0 +1,4 @@
+build/*
+.agents/*
+.codex/*
+kernel.errors.txt
