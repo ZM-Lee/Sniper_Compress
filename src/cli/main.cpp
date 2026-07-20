@@ -14,6 +14,7 @@
 #include <string>
 #include <map>
 #include <limits>
+#include <memory>
 #include <csignal>
 #include <numeric>
 #include <cerrno>
@@ -26,6 +27,7 @@
 #include "compress/compress.h"
 #include "compress/message.h"
 #include "compress/shm_ring.h"
+#include "can/can.h"
 #include "mqtt/mqtt_sender.h"
 #include "serial/serial_tx.h"
 
@@ -84,6 +86,18 @@ static void generate_test_frame(uint8_t* rgb, int width, int height, int frame_i
 static bool read_raw_frame(FILE* f, uint8_t* rgb, int size) {
     size_t n = fread(rgb, 1, size, f);
     return n == static_cast<size_t>(size);
+}
+
+static void copy_bgr_roi(const uint8_t* source, int source_width,
+                         int roi_x, int roi_y, int roi_width, int roi_height,
+                         uint8_t* destination) {
+    const size_t row_bytes = static_cast<size_t>(roi_width) * 3;
+    for (int row = 0; row < roi_height; ++row) {
+        const uint8_t* source_row = source +
+            (static_cast<size_t>(roi_y + row) * source_width + roi_x) * 3;
+        std::memcpy(destination + static_cast<size_t>(row) * row_bytes,
+                    source_row, row_bytes);
+    }
 }
 
 struct QueuedChunk {
@@ -180,12 +194,16 @@ static void usage(const char* prog) {
         "  --mqtt-host HOST      Send CustomByteBlock protobuf payloads to MQTT broker instead of serial\n"
         "  --mqtt-port PORT      MQTT broker port (default: 3333)\n"
         "  --mqtt-topic TOPIC    MQTT topic (default: CustomByteBlock)\n"
-        "  --mqtt-client-id ID   MQTT client id (default: doorlock_sniper)\n"
+        "  --mqtt-client-id ID   MQTT client id (default: auto-generated)\n"
         "  --mqtt-qos N          MQTT QoS (default: 1)\n"
         "  --serial-wait         Wait/reconnect forever if serial is absent or unplugged\n"
         "  --input FILE          Read raw BGR frames from file instead of test pattern\n"
         "  --shm-input           Read latest BGR frames from shared memory ring\n"
         "  --shm-name NAME       Shared memory ring name (default: /rm_camera_frames)\n"
+        "  --roi-size N          Square compression ROI size; 0 uses the full input (default: 0)\n"
+        "  --can-interface IFACE Enable ROI direction commands on this SocketCAN interface\n"
+        "  --can-cmd-id ID       Standard CAN command frame id (default: 0x170)\n"
+        "  --no-can              Disable CAN ROI commands\n"
         "  --save-bitstreams FILE  Save compressed bitstreams for bench_consumer.py\n"
         "  --profile             Print per-stage compression timing summary (keeps last 600 frames)\n"
         "  --prebuffer-chunks N   Buffer N chunks before serial TX starts (default: 4)\n"
@@ -234,12 +252,15 @@ int main(int argc, char* argv[]) {
     const char* mqtt_host = nullptr;
     int mqtt_port = 3333;
     const char* mqtt_topic = "CustomByteBlock";
-    const char* mqtt_client_id = "doorlock_sniper";
+    const char* mqtt_client_id = "";
     int mqtt_qos = 1;
     bool serial_wait = false;
     const char* input_file = nullptr;
     bool shm_input = false;
     const char* shm_name = "/rm_camera_frames";
+    int compression_roi_size = 0;
+    const char* can_interface = nullptr;
+    uint32_t can_command_id = rmcc_sniper::can::kDefaultCommandId;
     const char* save_bitstreams_file = nullptr;
     bool profile = false;
     const char* codec = "mbt";
@@ -348,6 +369,24 @@ int main(int argc, char* argv[]) {
             shm_input = true;
         } else if (strcmp(argv[i], "--shm-name") == 0) {
             if (++i < argc) shm_name = argv[i];
+        } else if (strcmp(argv[i], "--roi-size") == 0) {
+            if (!require_arg(i, argc, argv[i])) return 1;
+            compression_roi_size = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "--can-interface") == 0) {
+            if (!require_arg(i, argc, argv[i])) return 1;
+            can_interface = argv[++i];
+        } else if (strcmp(argv[i], "--can-cmd-id") == 0) {
+            if (!require_arg(i, argc, argv[i])) return 1;
+            char* end = nullptr;
+            errno = 0;
+            const unsigned long parsed = std::strtoul(argv[++i], &end, 0);
+            if (errno != 0 || end == argv[i] || *end != '\0' || parsed > 0x7ffUL) {
+                fprintf(stderr, "--can-cmd-id must be a standard CAN id in [0,0x7ff]\n");
+                return 1;
+            }
+            can_command_id = static_cast<uint32_t>(parsed);
+        } else if (strcmp(argv[i], "--no-can") == 0) {
+            can_interface = nullptr;
         } else if (strcmp(argv[i], "--save-bitstreams") == 0) {
             if (++i < argc) save_bitstreams_file = argv[i];
         } else if (strcmp(argv[i], "--codec") == 0) {
@@ -439,6 +478,10 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "--shm-input and --input are mutually exclusive\n");
         return 1;
     }
+    if (compression_roi_size < 0) {
+        fprintf(stderr, "--roi-size must be >= 0\n");
+        return 1;
+    }
     if (strcmp(codec, "mbt") != 0 && strcmp(codec, "msssim_qvrf") != 0) {
         fprintf(stderr, "Unsupported codec for compress: %s\n", codec);
         usage(argv[0]);
@@ -508,12 +551,27 @@ int main(int argc, char* argv[]) {
         printf("Using test pattern generator (moving bar)\n");
     }
 
+    const int source_width = width;
+    const int source_height = height;
+    const int adjusted_roi_side = std::min(
+        compression_roi_size, std::min(source_width, source_height));
+    int roi_width = compression_roi_size > 0 ? adjusted_roi_side : source_width;
+    int roi_height = compression_roi_size > 0 ? adjusted_roi_side : source_height;
+    if (compression_roi_size > 0 &&
+        (roi_width != compression_roi_size || roi_height != compression_roi_size)) {
+        fprintf(stderr, "Compression ROI %dx%d exceeds input %dx%d; adjusted to %dx%d\n",
+                compression_roi_size, compression_roi_size,
+                source_width, source_height, roi_width, roi_height);
+    }
+    rmcc_sniper::can::RoiController roi_controller(
+        source_width, source_height, roi_width, roi_height);
+
     // --- Create compressor ---
     compressor_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
     cfg.mbt_ir_path = model_path;
-    cfg.width = width;
-    cfg.height = height;
+    cfg.width = roi_width;
+    cfg.height = roi_height;
     cfg.codec_width = codec_size;
     cfg.codec_height = codec_size;
     cfg.device = device;
@@ -583,7 +641,8 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         printf("MQTT output connected to %s:%d topic=%s client_id=%s qos=%d\n",
-               mqtt_host, mqtt_port, mqtt_topic, mqtt_client_id, mqtt_qos);
+               mqtt_host, mqtt_port, mqtt_topic,
+               mqtt_client_id[0] == '\0' ? "(auto)" : mqtt_client_id, mqtt_qos);
     } else if (!dry_run) {
         while (!serial.open()) {
             if (!serial_wait) {
@@ -604,18 +663,38 @@ int main(int argc, char* argv[]) {
     }
 
     // --- Allocate buffers ---
-    const int frame_bytes = width * height * 3;
+    const int frame_bytes = source_width * source_height * 3;
     std::vector<uint8_t> frame_rgb(frame_bytes);
+    std::vector<uint8_t> roi_frame(static_cast<size_t>(roi_width) * roi_height * 3);
     std::vector<uint8_t> shm_frame;
     std::vector<uint8_t> bitstream(8192);  // compressed output (generous)
+
+    std::unique_ptr<rmcc_sniper::can::CanReceiver> can_receiver;
+    if (can_interface && can_interface[0] != '\0') {
+        can_receiver = std::make_unique<rmcc_sniper::can::CanReceiver>(
+            can_interface, can_command_id,
+            [&roi_controller](rmcc_sniper::can::Direction direction) {
+                const bool moved = roi_controller.move(direction);
+                const auto position = roi_controller.position();
+                fprintf(stderr, "CAN ROI %s: offset=(%d,%d)%s\n",
+                        rmcc_sniper::can::direction_name(direction),
+                        position.x, position.y, moved ? "" : " (boundary)");
+            });
+        can_receiver->start();
+    }
 
     // FPS pacing
     const double frame_interval_us = 1.0e6 / target_fps;
     const double chunk_interval_us = 1.0e6 / chunk_rate_hz;
 
-    printf("Starting: %s frames at %.1f FPS, input=%dx%d codec=%dx%d, codec=%s, redundancy=%d\n",
+    printf("Starting: %s frames at %.1f FPS, input=%dx%d roi=%dx%d codec=%dx%d, codec=%s, redundancy=%d\n",
            num_frames > 0 ? std::to_string(num_frames).c_str() : "unlimited",
-           target_fps, width, height, codec_size, codec_size, codec, redundancy);
+           target_fps, source_width, source_height, roi_width, roi_height,
+           codec_size, codec_size, codec, redundancy);
+    if (can_receiver) {
+        printf("CAN ROI:       interface=%s cmd_id=0x%03x step=%d pixels\n",
+               can_interface, can_command_id, rmcc_sniper::can::kRoiMovePixels);
+    }
     printf("Sender g_a:   backend=%s device=%s%s%s\n",
            tx_ga_backend,
            strcmp(tx_ga_backend, "tensorrt") == 0 ? "cuda:" : device,
@@ -676,6 +755,7 @@ int main(int argc, char* argv[]) {
 
     auto sender = [&]() {
         bool started = false;
+        bool mqtt_outage_reported = false;
         auto next_chunk_time = std::chrono::steady_clock::now();
         auto last_send_start = std::chrono::steady_clock::time_point{};
         const auto chunk_step = std::chrono::microseconds(static_cast<long long>(
@@ -750,11 +830,18 @@ int main(int argc, char* argv[]) {
 
             if (mqtt_output) {
                 if (mqtt_sender.send_payload(item.data)) {
+                    if (mqtt_outage_reported) {
+                        fprintf(stderr, "MQTT connection restored; publishing resumed\n");
+                        mqtt_outage_reported = false;
+                    }
                     total_chunks++;
                     total_bytes += static_cast<int>(item.data.size());
                 } else {
                     total_errors++;
-                    fprintf(stderr, "MQTT publish failed: %s\n", mqtt_sender.last_error().c_str());
+                    if (!mqtt_outage_reported) {
+                        fprintf(stderr, "MQTT publish paused: %s\n", mqtt_sender.last_error().c_str());
+                        mqtt_outage_reported = true;
+                    }
                 }
             } else if (ipc_output) {
                 if (ipc_fd < 0 || !write_all(ipc_fd, item.data.data(), item.data.size())) {
@@ -869,14 +956,18 @@ int main(int argc, char* argv[]) {
                 }
             }
         } else {
-            generate_test_frame(frame_rgb.data(), width, height, frame_id);
+            generate_test_frame(frame_rgb.data(), source_width, source_height, frame_id);
         }
         auto frame_acquired = std::chrono::steady_clock::now();
 
         // 2. Compress
+        const auto roi_position = roi_controller.position();
+        copy_bgr_roi(frame_rgb.data(), source_width,
+                     roi_position.x, roi_position.y, roi_width, roi_height,
+                     roi_frame.data());
         auto t0 = std::chrono::steady_clock::now();
         int bitstream_len = static_cast<int>(bitstream.size());
-        int ret = compress_frame(compressor, frame_rgb.data(),
+        int ret = compress_frame(compressor, roi_frame.data(),
                                     bitstream.data(), &bitstream_len);
         auto t1 = std::chrono::steady_clock::now();
         double compress_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
@@ -1237,6 +1328,7 @@ finish_frames:
     }
 
     // --- Cleanup ---
+    if (can_receiver) can_receiver->stop();
     if (!dry_run && !ipc_output) serial.close();
     compressor_destroy(compressor);
     if (raw_input) fclose(raw_input);

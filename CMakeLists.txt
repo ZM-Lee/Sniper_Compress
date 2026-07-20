@@ -11,6 +11,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 # OpenVINO
 find_package(OpenVINO REQUIRED)
 find_package(Protobuf REQUIRED)
+find_package(Threads REQUIRED)
 find_path(MOSQUITTO_INCLUDE_DIR mosquitto.h)
 find_library(MOSQUITTO_LIBRARY mosquitto)
 if(NOT MOSQUITTO_INCLUDE_DIR OR NOT MOSQUITTO_LIBRARY)
@@ -92,6 +93,15 @@ endif()
 # Resolve project root (where models/ lives) so the binary can be run from any CWD
 target_compile_definitions(rmcc_sniper PRIVATE "RM_PROJECT_ROOT=${RMCC_SNIPER_ROOT}")
 
+# --- CAN command receiver and ROI controller ---
+add_library(rmcc_can STATIC
+    src/can/can.cpp
+)
+target_include_directories(rmcc_can PUBLIC
+    ${RMCC_SNIPER_ROOT}/include
+)
+target_link_libraries(rmcc_can PUBLIC Threads::Threads)
+
 # --- CLI: compress ---
 add_executable(compress
     src/cli/main.cpp
@@ -107,6 +117,7 @@ target_include_directories(compress PRIVATE
 )
 target_link_libraries(compress PRIVATE
     rmcc_sniper
+    rmcc_can
     ${MOSQUITTO_LIBRARY}
     protobuf::libprotobuf
 )
@@ -179,6 +190,10 @@ endif()
 if(RMCC_SNIPER_BUILD_TOOLS)
     # --- tests (conditional: skip missing files) ---
     enable_testing()
+
+    add_executable(test_can src/test/test_can.cpp)
+    target_link_libraries(test_can PRIVATE rmcc_can)
+    add_test(NAME can_tests COMMAND test_can)
 
     set(TEST_SOURCES "")
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/test/test_compressor.cpp")

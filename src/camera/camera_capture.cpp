@@ -200,6 +200,11 @@ int64_t align_down(int64_t value, int64_t min_value, int64_t inc) {
     return min_value + ((value - min_value) / inc) * inc;
 }
 
+int64_t clamp_and_align(int64_t value, const GX_INT_RANGE& range) {
+    value = std::max<int64_t>(range.nMin, std::min<int64_t>(value, range.nMax));
+    return align_down(value, range.nMin, range.nInc);
+}
+
 int64_t align_square_down(int64_t value,
                           const GX_INT_RANGE& width_rng,
                           const GX_INT_RANGE& height_rng) {
@@ -310,8 +315,8 @@ bool configure_center_roi(GX_DEV_HANDLE handle, int requested_size, bool auto_sq
         !get_int_range(handle, GX_INT_OFFSET_Y, "OffsetY range", &oy_rng)) {
         return false;
     }
-    const int64_t ox = align_down((full_w - roi_w) / 2, ox_rng.nMin, ox_rng.nInc);
-    const int64_t oy = align_down((full_h - roi_h) / 2, oy_rng.nMin, oy_rng.nInc);
+    const int64_t ox = clamp_and_align((full_w - roi_w) / 2, ox_rng);
+    const int64_t oy = clamp_and_align((full_h - roi_h) / 2, oy_rng);
     if (!set_int(handle, GX_INT_OFFSET_X, "OffsetX", ox) ||
         !set_int(handle, GX_INT_OFFSET_Y, "OffsetY", oy)) {
         return false;
@@ -408,12 +413,16 @@ void apply_camera_features(GX_DEV_HANDLE handle, const CameraConfig& cfg) {
 SessionResult run_camera_session(const CameraOptions& opt, int frames_remaining) {
     SessionResult result{};
     GX_DEV_HANDLE handle = nullptr;
+    bool stream_started = false;
     compress::ShmRing ring;
 
     auto cleanup = [&]() {
         if (handle) {
-            GXStreamOff(handle);
-            GXCloseDevice(handle);
+            if (stream_started) {
+                warn_if_fail(GXStreamOff(handle), "GXStreamOff");
+                stream_started = false;
+            }
+            warn_if_fail(GXCloseDevice(handle), "GXCloseDevice");
             handle = nullptr;
         }
         ring.close();
@@ -490,6 +499,7 @@ SessionResult run_camera_session(const CameraOptions& opt, int frames_remaining)
         cleanup();
         return result;
     }
+    stream_started = true;
 
     std::printf("Daheng camera capture started: %ux%u BGR8 %.2f fps exposure %.1fus gain %.1f -> shm %s\n",
                 width, height, cfg.fps, cfg.exposure_us, cfg.gain, opt.shm_name);

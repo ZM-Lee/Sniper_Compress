@@ -138,11 +138,16 @@ BAUDRATE=921600
 MQTT_HOST=
 MQTT_PORT=3333
 MQTT_TOPIC=CustomByteBlock
-MQTT_CLIENT_ID=doorlock_sniper
+MQTT_CLIENT_ID=auto
 MQTT_QOS=1
 CAMERA_CONFIG=config/daheng_camera/feature.yaml
 CAMERA_INDEX=0
 CAMERA_ROI_MODE=max-square
+ROI_SIZE=1080
+COMPRESS_ROI_MODE=resample
+COMPRESS_ROI_SIZE=auto
+CAN_INTERFACE=can0
+CAN_CMD_ID=0x170
 CAMERA_FPS=60
 EXPOSURE_US=5000
 TX_DEVICE=GPU.0
@@ -254,9 +259,12 @@ sudo systemctl start mosquitto
   --mqtt-host 192.168.12.1 \
   --mqtt-port 3333 \
   --mqtt-topic CustomByteBlock \
-  --mqtt-client-id doorlock_sniper \
   --mqtt-qos 1
 ```
+
+默认的 `MQTT_CLIENT_ID=auto` 会为每个发送进程生成唯一 ID，避免同名客户端被 broker
+互相踢下线。只有接入端明确要求固定 ID 时才传 `--mqtt-client-id`，并确保同一时刻只有一个
+进程使用该 ID。
 
 MQTT 链路：
 
@@ -315,6 +323,7 @@ bin/compress \
   --tx-ga-backend openvino \
   --fps 24 \
   --codec-size 192 \
+  --roi-size 1080 \
   --chunks-per-frame 2 \
   --prebuffer-chunks 4 \
   --chunk-rate-hz 48 \
@@ -336,6 +345,7 @@ bin/compress \
   --tx-ga-backend openvino \
   --fps 24 \
   --codec-size 192 \
+  --roi-size 1080 \
   --chunks-per-frame 2 \
   --prebuffer-chunks 4 \
   --chunk-rate-hz 48 \
@@ -343,6 +353,42 @@ bin/compress \
   --mqtt-host 127.0.0.1 \
   --mqtt-port 3333 \
   --mqtt-topic CustomByteBlock
+```
+
+## CAN 控制压缩 ROI
+
+`config/sender.env` 中的 `COMPRESS_ROI_MODE` 用于选择压缩画面路径：
+
+- `resample`：默认方案。取中央 `ROI_SIZE`（默认 1080x1080），再缩放到 codec size；不启动 CAN。
+- `can`：手动方案。取 codec size 大小的 ROI，当前 192 预设即 192x192；启动 CAN，每条合法方向命令移动 10 pixel。
+
+`COMPRESS_ROI_SIZE=auto` 会按模式自动选择 1080 或 codec size。也可设置具体数值覆盖。
+ROI 左上角坐标始终限制在源画面内，配置尺寸超过源画面时会自动收缩。
+直接运行 `bin/compress` 时，CAN 模式对应参数为
+`--roi-size 192 --can-interface can0 --can-cmd-id 0x170`。
+
+仅接收一个标准 CAN 帧 ID，默认为 `0x170`。数据区固定为 8 字节：
+
+| Byte | 内容 |
+|---|---|
+| 0 | 方向：`1=上`、`2=下`、`3=左`、`4=右` |
+| 1 | 保留，固定为 0 |
+| 2 | Byte 0..1 的 CRC8 |
+| 3..5 | 保留，固定为 0 |
+| 6 | Byte 0..5 的 CRC16 低字节 |
+| 7 | Byte 0..5 的 CRC16 高字节 |
+
+CRC 与 `serial_driver` 示例一致：CRC8 使用 `poly=0x31`、`init=0xFF`；CRC16
+使用反射形式 `poly=0x1021`、`init=0xFFFF`，校验值按小端序存放。CRC8、CRC16
+或保留字段任一不合法时，整条方向命令都会被丢弃。
+
+四个固定测试帧如下：
+
+```bash
+cansend can0 170#010045000000BB74  # 上
+cansend can0 170#02001000000087C3  # 下
+cansend can0 170#0300D4000000998E  # 左
+cansend can0 170#0400BA000000EEA5  # 右
 ```
 
 ## 输出结果怎么看
@@ -455,6 +501,9 @@ mosquitto_sub -h 127.0.0.1 -p 3333 -t CustomByteBlock
 ```
 
 如果 broker 使用默认 1883 端口，运行时也要改成 `--mqtt-port 1883`。
+
+如果连接成功后很快出现断线，检查是否有另一个客户端使用相同的
+`--mqtt-client-id`。MQTT broker 会断开旧的同名连接；通常保留默认的自动 ID 即可。
 
 ## 注意事项
 

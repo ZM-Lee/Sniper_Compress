@@ -11,6 +11,10 @@ CAMERA_FRAMES="0"
 CAMERA_CONFIG="${ROOT}/config/daheng_camera/feature.yaml"
 CAMERA_INDEX="0"
 ROI_SIZE="1080"
+COMPRESS_ROI_MODE="resample"
+COMPRESS_ROI_SIZE="auto"
+CAN_INTERFACE="can0"
+CAN_CMD_ID="0x170"
 CAMERA_ROI_MODE="max-square"
 CAMERA_FPS="60"
 EXPOSURE_US="5000"
@@ -45,7 +49,7 @@ GUI_TORCH_DEVICE=""
 MQTT_HOST="192.168.12.1"
 MQTT_PORT="3333"
 MQTT_TOPIC="CustomByteBlock"
-MQTT_CLIENT_ID="doorlock_sniper"
+MQTT_CLIENT_ID="auto"
 MQTT_QOS="1"
 CLIENT_ID="1"
 SERIAL_PORT="/dev/ttyUSB0"
@@ -94,6 +98,11 @@ Options:
   --camera-config PATH          Daheng YAML config (default: ${CAMERA_CONFIG})
   --camera-index N              Daheng device index (default: ${CAMERA_INDEX})
   --roi-size N                  Fixed camera center ROI size; also sets --camera-roi-mode fixed
+  --compress-roi-mode MODE      resample|can (default: ${COMPRESS_ROI_MODE})
+  --compress-roi-size N         Override mode-selected compression ROI size
+  --can-interface IFACE         SocketCAN interface (default: ${CAN_INTERFACE})
+  --can-cmd-id ID               Direction command CAN frame id (default: ${CAN_CMD_ID})
+  --no-can                      Disable CAN ROI commands
   --camera-roi-mode MODE        fixed|max-square (default: ${CAMERA_ROI_MODE})
                                 max-square = detect max resolution, center-crop shortest-side square
   --camera-fps FPS              Camera FPS (default: ${CAMERA_FPS})
@@ -196,6 +205,11 @@ while [[ $# -gt 0 ]]; do
     --camera-config) CAMERA_CONFIG="$2"; shift 2 ;;
     --camera-index) CAMERA_INDEX="$2"; shift 2 ;;
     --roi-size) ROI_SIZE="$2"; CAMERA_ROI_MODE="fixed"; shift 2 ;;
+    --compress-roi-mode) COMPRESS_ROI_MODE="$2"; shift 2 ;;
+    --compress-roi-size) COMPRESS_ROI_SIZE="$2"; shift 2 ;;
+    --can-interface) CAN_INTERFACE="$2"; shift 2 ;;
+    --can-cmd-id) CAN_CMD_ID="$2"; shift 2 ;;
+    --no-can) CAN_INTERFACE=""; shift ;;
     --camera-roi-mode|--roi-mode) CAMERA_ROI_MODE="$2"; shift 2 ;;
     --auto-square-roi) CAMERA_ROI_MODE="max-square"; shift ;;
     --camera-fps) CAMERA_FPS="$2"; shift 2 ;;
@@ -255,6 +269,11 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "${MQTT_CLIENT_ID}" || "${MQTT_CLIENT_ID}" == "auto" ]]; then
+  mqtt_node="${HOSTNAME:-nuc}"
+  MQTT_CLIENT_ID="rmcc-${mqtt_node%%.*}-$$"
+fi
+
 case "${CODEC}" in mbt|msssim_qvrf) ;; *) echo "Unknown codec: ${CODEC}" >&2; exit 1 ;; esac
 case "${TRANSPORT}" in serial|mqtt|offline-debug) ;; *) echo "Unknown transport: ${TRANSPORT}" >&2; exit 1 ;; esac
 case "${CAMERA_ROI_MODE}" in fixed|max-square) ;; *) echo "Unknown camera ROI mode: ${CAMERA_ROI_MODE}" >&2; exit 1 ;; esac
@@ -263,6 +282,20 @@ if [[ "${TRANSPORT}" == "offline-debug" && -z "${PRESET}" && "${CODEC}" == "mbt"
   PRESET="offline320x9x5"
   apply_preset "${PRESET}"
 fi
+case "${COMPRESS_ROI_MODE}" in
+  resample)
+    [[ -z "${COMPRESS_ROI_SIZE}" || "${COMPRESS_ROI_SIZE}" == "auto" ]] && COMPRESS_ROI_SIZE="${ROI_SIZE}"
+    CAN_ROI_ENABLED=0
+    ;;
+  can)
+    [[ -z "${COMPRESS_ROI_SIZE}" || "${COMPRESS_ROI_SIZE}" == "auto" ]] && COMPRESS_ROI_SIZE="${CODEC_SIZE}"
+    CAN_ROI_ENABLED=1
+    ;;
+  *)
+    echo "Unknown compression ROI mode: ${COMPRESS_ROI_MODE} (expected resample or can)" >&2
+    exit 1
+    ;;
+esac
 if [[ "${REALESR_MODEL}" != /* ]]; then
   REALESR_MODEL="${ROOT}/${REALESR_MODEL}"
 fi
@@ -454,6 +487,7 @@ Resolved stream profile:
   prebuffer    : ${PREBUFFER_CHUNKS} chunks
   tail flush   : ${TAIL_FLUSH_CHUNKS} chunks
   camera       : daheng, index=${CAMERA_INDEX}, config=${CAMERA_CONFIG}, roi_mode=${CAMERA_ROI_MODE}, roi=${ROI_SIZE}, fps=${CAMERA_FPS}, exposure=${EXPOSURE_US}us
+  compression  : mode=${COMPRESS_ROI_MODE}, roi=${COMPRESS_ROI_SIZE}x${COMPRESS_ROI_SIZE}, can=$([[ "${CAN_ROI_ENABLED}" == "1" ]] && echo "${CAN_INTERFACE:-disabled}" || echo disabled), cmd_id=${CAN_CMD_ID}, step=10px
   torch        : tx=${TX_TORCH_DEVICE}, gui=${GUI_TORCH_DEVICE}
   sender g_a   : backend=${TX_GA_BACKEND}, device=$([[ "${TX_GA_BACKEND}" == "tensorrt" ]] && echo "cuda:${TX_TRT_DEVICE}, engine=${TX_TRT_ENGINE}" || echo "${TX_DEVICE}")
   h_a/h_s      : OpenVINO FP32 CPU (hard requirement)
@@ -659,6 +693,7 @@ if [[ "${CODEC}" == "mbt" || "${QVRF_CPP_SENDER}" == "1" ]]; then
     -m "${MODEL}"
     --fps "${FPS}"
     --codec-size "${CODEC_SIZE}"
+    --roi-size "${COMPRESS_ROI_SIZE}"
     --chunks-per-frame "${CHUNKS_PER_FRAME}"
     --fec-data-chunks "${FEC_DATA_CHUNKS}"
     --prebuffer-chunks "${PREBUFFER_CHUNKS}"
@@ -668,6 +703,9 @@ if [[ "${CODEC}" == "mbt" || "${QVRF_CPP_SENDER}" == "1" ]]; then
     --chunk-order "${CHUNK_ORDER}"
     --profile
   )
+  if [[ "${CAN_ROI_ENABLED}" == "1" && -n "${CAN_INTERFACE}" ]]; then
+    TX_CMD+=(--can-interface "${CAN_INTERFACE}" --can-cmd-id "${CAN_CMD_ID}")
+  fi
   if [[ "${QVRF_CPP_SENDER}" == "1" ]]; then
     TX_CMD+=(--qvrf-cpp-sender)
   fi

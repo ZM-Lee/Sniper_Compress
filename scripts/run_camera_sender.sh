@@ -23,7 +23,11 @@ Options:
   --camera-config PATH
   --camera-index N
   --camera-roi-mode fixed|max-square
-  --roi-size N
+  --roi-size N               Fixed camera hardware ROI size
+  --compress-roi-mode MODE   resample|can
+  --compress-roi-size N      Override mode-selected compression ROI size
+  --can-interface IFACE      SocketCAN interface; empty disables CAN
+  --can-cmd-id ID            Direction command CAN frame id
   --camera-fps FPS
   --exposure-us N
   --prebuffer-chunks N
@@ -50,6 +54,11 @@ while [[ $# -gt 0 ]]; do
     --camera-index) CAMERA_INDEX="$2"; shift 2 ;;
     --camera-roi-mode|--roi-mode) CAMERA_ROI_MODE="$2"; shift 2 ;;
     --roi-size) ROI_SIZE="$2"; CAMERA_ROI_MODE=fixed; shift 2 ;;
+    --compress-roi-mode) COMPRESS_ROI_MODE="$2"; shift 2 ;;
+    --compress-roi-size) COMPRESS_ROI_SIZE="$2"; shift 2 ;;
+    --can-interface) CAN_INTERFACE="$2"; shift 2 ;;
+    --can-cmd-id) CAN_CMD_ID="$2"; shift 2 ;;
+    --no-can) CAN_INTERFACE=""; shift ;;
     --camera-fps) CAMERA_FPS="$2"; shift 2 ;;
     --exposure-us) EXPOSURE_US="$2"; shift 2 ;;
     --prebuffer-chunks) PREBUFFER_CHUNKS="$2"; shift 2 ;;
@@ -58,6 +67,11 @@ while [[ $# -gt 0 ]]; do
     *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
   esac
 done
+
+if [[ -z "${MQTT_CLIENT_ID}" || "${MQTT_CLIENT_ID}" == "auto" ]]; then
+  mqtt_node="${HOSTNAME:-nuc}"
+  MQTT_CLIENT_ID="rmcc-${mqtt_node%%.*}-$$"
+fi
 
 case "${PRESET}" in
   qvrf192x1x24_lowlat)
@@ -72,6 +86,21 @@ case "${PRESET}" in
   *)
     echo "Unknown preset: ${PRESET}" >&2
     usage
+    exit 1
+    ;;
+esac
+
+case "${COMPRESS_ROI_MODE}" in
+  resample)
+    [[ -z "${COMPRESS_ROI_SIZE}" || "${COMPRESS_ROI_SIZE}" == "auto" ]] && COMPRESS_ROI_SIZE="${ROI_SIZE}"
+    CAN_ROI_ENABLED=0
+    ;;
+  can)
+    [[ -z "${COMPRESS_ROI_SIZE}" || "${COMPRESS_ROI_SIZE}" == "auto" ]] && COMPRESS_ROI_SIZE="${CODEC_SIZE}"
+    CAN_ROI_ENABLED=1
+    ;;
+  *)
+    echo "Unknown compression ROI mode: ${COMPRESS_ROI_MODE} (expected resample or can)" >&2
     exit 1
     ;;
 esac
@@ -111,6 +140,7 @@ else
   echo "serial=${SERIAL_PORT}@${BAUDRATE} frames=${FRAMES}"
 fi
 echo "camera=daheng index:${CAMERA_INDEX} config:${CAMERA_CONFIG} roi_mode:${CAMERA_ROI_MODE} roi:${ROI_SIZE} fps:${CAMERA_FPS} exposure:${EXPOSURE_US}us"
+echo "compression_mode=${COMPRESS_ROI_MODE} roi=${COMPRESS_ROI_SIZE} can=$([[ "${CAN_ROI_ENABLED}" == "1" ]] && echo "${CAN_INTERFACE:-disabled}" || echo disabled) cmd_id=${CAN_CMD_ID} step=10px"
 echo "g_a=${TX_GA_BACKEND} device=${TX_DEVICE} trt_engine=${TX_TRT_ENGINE:-none}"
 
 rm -f "/dev/shm${SHM_NAME}" 2>/dev/null || true
@@ -150,6 +180,7 @@ TX_CMD=(
   --tx-ga-backend "${TX_GA_BACKEND}"
   --fps "${FPS}"
   --codec-size "${CODEC_SIZE}"
+  --roi-size "${COMPRESS_ROI_SIZE}"
   --chunks-per-frame "${CHUNKS_PER_FRAME}"
   --fec-data-chunks 0
   --prebuffer-chunks "${PREBUFFER_CHUNKS}"
@@ -159,6 +190,9 @@ TX_CMD=(
   --chunk-order "${CHUNK_ORDER}"
   --profile
 )
+if [[ "${CAN_ROI_ENABLED}" == "1" && -n "${CAN_INTERFACE}" ]]; then
+  TX_CMD+=(--can-interface "${CAN_INTERFACE}" --can-cmd-id "${CAN_CMD_ID}")
+fi
 if [[ -n "${MQTT_HOST}" ]]; then
   TX_CMD+=(--mqtt-host "${MQTT_HOST}" --mqtt-port "${MQTT_PORT}" --mqtt-topic "${MQTT_TOPIC}" --mqtt-client-id "${MQTT_CLIENT_ID}" --mqtt-qos "${MQTT_QOS}")
 else
