@@ -202,7 +202,7 @@ static void usage(const char* prog) {
         "  --shm-name NAME       Shared memory ring name (default: /rm_camera_frames)\n"
         "  --roi-size N          Square compression ROI size; 0 uses the full input (default: 0)\n"
         "  --can-interface IFACE Enable ROI direction commands on this SocketCAN interface\n"
-        "  --can-cmd-id ID       Standard CAN command frame id (default: 0x170)\n"
+        "  --can-cmd-id ID       Standard CAN command frame id (default: 0x180)\n"
         "  --no-can              Disable CAN ROI commands\n"
         "  --save-bitstreams FILE  Save compressed bitstreams for bench_consumer.py\n"
         "  --profile             Print per-stage compression timing summary (keeps last 600 frames)\n"

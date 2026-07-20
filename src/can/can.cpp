@@ -1,7 +1,5 @@
 #include "can/can.h"
 
-#include "can/crc.h"
-
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -32,21 +30,11 @@ std::array<uint8_t, kCommandPayloadSize> make_command_payload(
     Direction direction) {
     std::array<uint8_t, kCommandPayloadSize> payload{};
     payload[0] = static_cast<uint8_t>(direction);
-    payload[2] = Crc::crc8(payload.data(), 2);
-    const uint16_t crc16 = Crc::crc16(payload.data(), payload.size() - 2);
-    payload[6] = static_cast<uint8_t>(crc16 & 0xffU);
-    payload[7] = static_cast<uint8_t>(crc16 >> 8U);
     return payload;
 }
 
 bool parse_command_payload(const uint8_t* data, size_t length, Direction* direction) {
     if (data == nullptr || direction == nullptr || length != kCommandPayloadSize) {
-        return false;
-    }
-    if (!Crc::verify_crc8(data, 3) || !Crc::verify_crc16(data, length)) {
-        return false;
-    }
-    if (data[1] != 0 || data[3] != 0 || data[4] != 0 || data[5] != 0) {
         return false;
     }
     switch (static_cast<Direction>(data[0])) {
@@ -179,7 +167,7 @@ void CanReceiver::run() {
 
             Direction direction{};
             if (!parse_command_payload(frame.data, frame.can_dlc, &direction)) {
-                std::fprintf(stderr, "CAN cmd_id=0x%03x rejected: invalid payload/CRC\n",
+                std::fprintf(stderr, "CAN cmd_id=0x%03x rejected: invalid DLC/direction\n",
                              command_id_);
                 continue;
             }

@@ -147,7 +147,7 @@ ROI_SIZE=1080
 COMPRESS_ROI_MODE=resample
 COMPRESS_ROI_SIZE=auto
 CAN_INTERFACE=can0
-CAN_CMD_ID=0x170
+CAN_CMD_ID=0x180
 CAMERA_FPS=60
 EXPOSURE_US=5000
 TX_DEVICE=GPU.0
@@ -365,30 +365,26 @@ bin/compress \
 `COMPRESS_ROI_SIZE=auto` 会按模式自动选择 1080 或 codec size。也可设置具体数值覆盖。
 ROI 左上角坐标始终限制在源画面内，配置尺寸超过源画面时会自动收缩。
 直接运行 `bin/compress` 时，CAN 模式对应参数为
-`--roi-size 192 --can-interface can0 --can-cmd-id 0x170`。
+`--roi-size 192 --can-interface can0 --can-cmd-id 0x180`。
 
-仅接收一个标准 CAN 帧 ID，默认为 `0x170`。数据区固定为 8 字节：
+仅接收一个标准 CAN 帧 ID，默认为 `0x180`。`cmd_id` 位于 CAN 帧头的
+`can_id` 字段中，不占用数据区；接收端校验 `can_id` 通过后，再校验 DLC 和方向值，
+最后执行 ROI 移动。数据区固定为 1 字节：
 
 | Byte | 内容 |
 |---|---|
 | 0 | 方向：`1=上`、`2=下`、`3=左`、`4=右` |
-| 1 | 保留，固定为 0 |
-| 2 | Byte 0..1 的 CRC8 |
-| 3..5 | 保留，固定为 0 |
-| 6 | Byte 0..5 的 CRC16 低字节 |
-| 7 | Byte 0..5 的 CRC16 高字节 |
 
-CRC 与 `serial_driver` 示例一致：CRC8 使用 `poly=0x31`、`init=0xFF`；CRC16
-使用反射形式 `poly=0x1021`、`init=0xFFFF`，校验值按小端序存放。CRC8、CRC16
-或保留字段任一不合法时，整条方向命令都会被丢弃。
+不再添加应用层 CRC8/CRC16，帧传输校验由 CAN 控制器的链路层 CRC 自动完成。
+DLC 不是 1 或方向值不在 1~4 时，整条命令会被丢弃。
 
 四个固定测试帧如下：
 
 ```bash
-cansend can0 170#010045000000BB74  # 上
-cansend can0 170#02001000000087C3  # 下
-cansend can0 170#0300D4000000998E  # 左
-cansend can0 170#0400BA000000EEA5  # 右
+cansend can0 180#01  # 上
+cansend can0 180#02  # 下
+cansend can0 180#03  # 左
+cansend can0 180#04  # 右
 ```
 
 ## 输出结果怎么看

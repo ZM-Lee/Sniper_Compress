@@ -11,9 +11,9 @@
 
 namespace rmcc_sniper::can {
 
-constexpr uint32_t kDefaultCommandId = 0x170;
+constexpr uint32_t kDefaultCommandId = 0x180;
 constexpr int kRoiMovePixels = 10;
-constexpr size_t kCommandPayloadSize = 8;
+constexpr size_t kCommandPayloadSize = 1;
 
 enum class Direction : uint8_t {
     Up = 1,
