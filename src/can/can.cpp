@@ -37,6 +37,10 @@ bool parse_command_payload(const uint8_t* data, size_t length, Direction* direct
     if (data == nullptr || direction == nullptr || length != kCommandPayloadSize) {
         return false;
     }
+    if (!std::all_of(data + 1, data + kCommandPayloadSize,
+                     [](uint8_t value) { return value == 0; })) {
+        return false;
+    }
     switch (static_cast<Direction>(data[0])) {
         case Direction::Up:
         case Direction::Down:
@@ -101,20 +105,12 @@ void CanReceiver::stop() {
 
 namespace {
 
-int open_can_socket(const std::string& interface_name, uint32_t command_id) {
+int open_can_socket(const std::string& interface_name) {
     const unsigned int interface_index = if_nametoindex(interface_name.c_str());
     if (interface_index == 0) return -1;
 
     const int fd = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (fd < 0) return -1;
-
-    can_filter filter{};
-    filter.can_id = command_id;
-    filter.can_mask = CAN_SFF_MASK | CAN_EFF_FLAG | CAN_RTR_FLAG;
-    if (setsockopt(fd, SOL_CAN_RAW, CAN_RAW_FILTER, &filter, sizeof(filter)) < 0) {
-        close(fd);
-        return -1;
-    }
 
     sockaddr_can address{};
     address.can_family = AF_CAN;
@@ -126,12 +122,31 @@ int open_can_socket(const std::string& interface_name, uint32_t command_id) {
     return fd;
 }
 
+void log_rejected_frame(const char* reason, const can_frame& frame,
+                        uint32_t expected_id) {
+    char data_hex[CAN_MAX_DLEN * 2 + 1]{};
+    const uint8_t data_length = std::min<uint8_t>(frame.can_dlc, CAN_MAX_DLEN);
+    for (uint8_t i = 0; i < data_length; ++i) {
+        std::snprintf(data_hex + i * 2, sizeof(data_hex) - i * 2,
+                      "%02x", frame.data[i]);
+    }
+    const bool extended = (frame.can_id & CAN_EFF_FLAG) != 0;
+    const uint32_t received_id = frame.can_id &
+        (extended ? CAN_EFF_MASK : CAN_SFF_MASK);
+    // std::fprintf(stderr,
+    //              "CAN rejected: reason=%s id=0x%x expected=0x%03x "
+    //              "type=%s dlc=%u data=%s\n",
+    //              reason, received_id, expected_id,
+    //              extended ? "EFF" : "SFF", frame.can_dlc,
+    //              data_length > 0 ? data_hex : "(empty)");
+}
+
 }  // namespace
 
 void CanReceiver::run() {
     int retry_count = 0;
     while (!stop_requested_.load()) {
-        const int fd = open_can_socket(interface_name_, command_id_);
+        const int fd = open_can_socket(interface_name_);
         if (fd < 0) {
             if (retry_count == 0 || retry_count % 5 == 0) {
                 std::fprintf(stderr, "CAN %s open failed: %s; retrying\n",
@@ -160,15 +175,35 @@ void CanReceiver::run() {
             can_frame frame{};
             const ssize_t bytes = recv(fd, &frame, sizeof(frame), 0);
             if (bytes != static_cast<ssize_t>(sizeof(frame))) break;
-            if ((frame.can_id & (CAN_EFF_FLAG | CAN_RTR_FLAG | CAN_ERR_FLAG)) != 0 ||
-                (frame.can_id & CAN_SFF_MASK) != command_id_) {
+            if ((frame.can_id & CAN_ERR_FLAG) != 0) {
+                log_rejected_frame("error-frame", frame, command_id_);
+                continue;
+            }
+            if ((frame.can_id & CAN_RTR_FLAG) != 0) {
+                log_rejected_frame("remote-frame", frame, command_id_);
+                continue;
+            }
+            if ((frame.can_id & CAN_EFF_FLAG) != 0) {
+                log_rejected_frame("extended-frame", frame, command_id_);
+                continue;
+            }
+            if ((frame.can_id & CAN_SFF_MASK) != command_id_) {
+                log_rejected_frame("unexpected-cmd-id", frame, command_id_);
                 continue;
             }
 
             Direction direction{};
             if (!parse_command_payload(frame.data, frame.can_dlc, &direction)) {
-                std::fprintf(stderr, "CAN cmd_id=0x%03x rejected: invalid DLC/direction\n",
-                             command_id_);
+                const char* reason = "invalid-dlc";
+                if (frame.can_dlc == kCommandPayloadSize) {
+                    if (frame.data[0] < static_cast<uint8_t>(Direction::Up) ||
+                        frame.data[0] > static_cast<uint8_t>(Direction::Right)) {
+                        reason = "invalid-direction";
+                    } else {
+                        reason = "invalid-padding";
+                    }
+                }
+                log_rejected_frame(reason, frame, command_id_);
                 continue;
             }
             if (handler_) handler_(direction);

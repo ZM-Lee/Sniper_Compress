@@ -9,10 +9,10 @@ int main() {
     static_assert(kDefaultCommandId == 0x180, "unexpected CAN command id");
 
     const std::array<std::array<uint8_t, kCommandPayloadSize>, 4> known_payloads{{
-        {{0x01}},
-        {{0x02}},
-        {{0x03}},
-        {{0x04}},
+        {{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+        {{0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+        {{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+        {{0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
     }};
     for (size_t i = 0; i < known_payloads.size(); ++i) {
         assert(make_command_payload(static_cast<Direction>(i + 1)) == known_payloads[i]);
@@ -25,8 +25,11 @@ int main() {
     auto corrupt = payload;
     corrupt[0] = 0x05;
     assert(!parse_command_payload(corrupt.data(), corrupt.size(), &direction));
-    const uint8_t oversized[] = {0x01, 0x00};
-    assert(!parse_command_payload(oversized, sizeof(oversized), &direction));
+    auto invalid_padding = payload;
+    invalid_padding[7] = 0x01;
+    assert(!parse_command_payload(
+        invalid_padding.data(), invalid_padding.size(), &direction));
+    assert(!parse_command_payload(payload.data(), payload.size() - 1, &direction));
 
     RoiController roi(1200, 1200, 192, 192);
     assert(roi.position().x == 504 && roi.position().y == 504);
